@@ -40,17 +40,49 @@ OnDeviceStateChanged({0.0.1.00000000}.{cca6d7b1 - c873 - 474c - 96ac - c5e3aa367
 OnDefaultDeviceChanged(eCapture, eCommunications, {0.0.1.00000000}.{68871b99-8a50-4ba8-b025-10f7e9de39da})
 */
 
-LPCWSTR g_searchDeviceName = L"Headphones (2- Bose QC Headphones)";
+constexpr size_t g_staticStringMaxSize = 4096u;
+constexpr size_t g_staticStringMaxLength = g_staticStringMaxSize - 1u;
 
-// watcher can read g_foundDeviceId anytime but needs to enter g_criticalSection to modify g_foundDeviceId
-// main needs to enter g_criticalSection to read g_foundDeviceId and cannot modify g_foundDeviceId
+WCHAR g_searchDeviceName[g_staticStringMaxSize];
+
+// watcher can read g_foundDeviceId / g_foundDeviceIdLength anytime but needs to enter g_criticalSection to modify them
+// main needs to enter g_criticalSection to read g_foundDeviceId / g_foundDeviceIdLength and cannot modify them
 CRITICAL_SECTION g_criticalSection;
-LPWSTR g_foundDeviceId = nullptr;
+WCHAR g_foundDeviceId[g_staticStringMaxSize];
 
 HANDLE g_foundDeviceWakeupEvent;
 HANDLE g_audioRenderWakeupEvent;
 
-void SearchHeadphonesDeviceId(IMMDeviceEnumerator* _enumerator) {
+void SearchHeadphonesDeviceIdByName(IMMDeviceEnumerator* _enumerator) {
+	HANDLE logFile = CreateFileA("QuietComfortPopRemover.log", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+
+	if (g_searchDeviceName[0u] == L'\0') {
+		if (logFile) {
+			const char* str = "No headset device name provided to QuietComfortPopRemover.exe as argument. Listing connected device names :\r\n";
+			size_t size = strlen(str);
+			DWORD tmp;
+			WriteFile(logFile, str, size, &tmp, NULL);
+		}
+	}
+	else {
+		if (logFile) {
+			DWORD tmp;
+
+			const char* prefix = "Starting search for a headset with name : \"";
+			size_t sizePrefix = strlen(prefix);
+			WriteFile(logFile, prefix, sizePrefix, &tmp, NULL);
+
+			constexpr size_t mbyteMaxSize = g_staticStringMaxSize * sizeof(WCHAR);
+			char mbyte[mbyteMaxSize];
+			size_t mbyteLen = wcstombs(mbyte, g_searchDeviceName, mbyteMaxSize);
+			WriteFile(logFile, mbyte, mbyteLen, &tmp, NULL);
+
+			const char* postfix = "\" while listing connected device names.\r\n";
+			size_t sizePostfix = strlen(postfix);
+			WriteFile(logFile, postfix, sizePostfix, &tmp, NULL);
+		}
+	}
+
 	HRESULT result;
 
 	// Enumerate devices
@@ -90,25 +122,49 @@ void SearchHeadphonesDeviceId(IMMDeviceEnumerator* _enumerator) {
 
 		result = devicePropertyStore->GetValue(PKEY_Device_FriendlyName, &propertyName);
 		if (SUCCEEDED(result) && propertyName.vt != VT_EMPTY) {
-			int nameComparison = wcscmp(g_searchDeviceName, propertyName.pwszVal);
-			if (nameComparison == 0) {
+			if (logFile) {
+				DWORD tmp;
 
-				// Register the id of the device with a matching name
+				constexpr size_t mbyteMaxSize = g_staticStringMaxSize * sizeof(WCHAR);
+				char mbyte[mbyteMaxSize];
 
-				LPWSTR deviceId;
-				result = device->GetId(&deviceId);
-				if (SUCCEEDED(result)) {
-					EnterCriticalSection(&g_criticalSection);
-					if (g_foundDeviceId) {
-						CoTaskMemFree(g_foundDeviceId);
+				size_t mbyteLen = wcstombs(mbyte, propertyName.pwszVal, mbyteMaxSize);
+				WriteFile(logFile, mbyte, mbyteLen, &tmp, NULL);
+
+				char EOL[2u] = { '\r', '\n' };
+				WriteFile(logFile, EOL, 2u, &tmp, NULL);
+			}
+
+			if (g_searchDeviceName[0u] != L'\0') {
+				int nameComparison = wcscmp(g_searchDeviceName, propertyName.pwszVal);
+				if (nameComparison == 0) {
+
+					// Register the id of the device with a matching name
+
+					LPWSTR deviceId;
+					result = device->GetId(&deviceId);
+					if (SUCCEEDED(result)) {
+						EnterCriticalSection(&g_criticalSection);
+						size_t deviceIdLength = wcslen(deviceId);
+						memcpy(g_foundDeviceId, deviceId, (deviceIdLength + 1u) * sizeof(WCHAR));
+						LeaveCriticalSection(&g_criticalSection);
+
+						CoTaskMemFree(deviceId);
+						PropVariantClear(&propertyName);
+						devicePropertyStore->Release();
+						deviceCollection->Release();
+
+						if (logFile) {
+							DWORD tmp;
+
+							const char* str = "Successfully found the headset at startup ; stopping search.";
+							size_t size = strlen(str);
+							WriteFile(logFile, str, size, &tmp, NULL);
+							CloseHandle(logFile);
+						}
+
+						return;
 					}
-					g_foundDeviceId = deviceId;
-					LeaveCriticalSection(&g_criticalSection);
-
-					PropVariantClear(&propertyName);
-					devicePropertyStore->Release();
-					deviceCollection->Release();
-					return;
 				}
 			}
 		}
@@ -119,6 +175,8 @@ void SearchHeadphonesDeviceId(IMMDeviceEnumerator* _enumerator) {
 	}
 
 	deviceCollection->Release();
+
+	if (logFile) CloseHandle(logFile);
 }
 
 struct DeviceWatcher : IMMNotificationClient {
@@ -130,14 +188,13 @@ struct DeviceWatcher : IMMNotificationClient {
 	HRESULT OnDeviceAdded(LPCWSTR pwstrDeviceId) { return 0; }
 	HRESULT OnDeviceRemoved(LPCWSTR pwstrDeviceId) { return 0; }
 	HRESULT OnDeviceStateChanged(LPCWSTR pwstrDeviceId, DWORD dwNewState) {
-		if (dwNewState == DEVICE_STATE_UNPLUGGED && g_foundDeviceId && wcscmp(pwstrDeviceId, g_foundDeviceId) == 0) {
+		if (dwNewState == DEVICE_STATE_UNPLUGGED && g_foundDeviceId[0u] != L'\0' && wcscmp(pwstrDeviceId, g_foundDeviceId) == 0) {
 			EnterCriticalSection(&g_criticalSection);
-			CoTaskMemFree(g_foundDeviceId);
-			g_foundDeviceId = nullptr;
+			g_foundDeviceId[0u] = L'\0';
 			LeaveCriticalSection(&g_criticalSection);
 		}
 
-		if (dwNewState == DEVICE_STATE_ACTIVE) {
+		if (dwNewState == DEVICE_STATE_ACTIVE && g_searchDeviceName[0u] != L'\0') {
 			HRESULT result;
 
 			IMMDevice* device;
@@ -154,21 +211,15 @@ struct DeviceWatcher : IMMNotificationClient {
 					if (SUCCEEDED(result) && propertyName.vt != VT_EMPTY) {
 						int nameComparison = wcscmp(g_searchDeviceName, propertyName.pwszVal);
 						if (nameComparison == 0) {
-
-							// Make a copy allocated with CoTaskMemAlloc
-
-							size_t bytesize = wcslen(pwstrDeviceId) + 2u;
-							LPWSTR copy = (LPWSTR)CoTaskMemAlloc(bytesize);
-							wcscpy((LPWSTR)copy, pwstrDeviceId);
-
 							// Register the id of the device with a matching name
 
 							EnterCriticalSection(&g_criticalSection);
-							if (g_foundDeviceId) {
-								CoTaskMemFree(g_foundDeviceId);
-							}
-							g_foundDeviceId = copy;
+
+							size_t deviceIdLength = wcslen(pwstrDeviceId);
+							memcpy(g_foundDeviceId, pwstrDeviceId, (deviceIdLength + 1u) * sizeof(WCHAR));
+
 							SetEvent(g_foundDeviceWakeupEvent);
+
 							LeaveCriticalSection(&g_criticalSection);
 						}
 					}
@@ -190,6 +241,16 @@ struct DeviceWatcher : IMMNotificationClient {
 };
 
 int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+
+	LPWSTR commandLine = GetCommandLineW();
+
+	int argc = 0;
+	LPWSTR* argv = CommandLineToArgvW(commandLine, &argc);
+	if (argc > 1) {
+		size_t argLen = wcslen(argv[1u]);
+		memcpy(g_searchDeviceName, argv[1u], (argLen + 1u) * sizeof(WCHAR));
+	}
+
 	HRESULT result;
 
 	InitializeCriticalSection(&g_criticalSection);
@@ -213,13 +274,15 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 		return 1u;
 	}
 
-	SearchHeadphonesDeviceId(enumerator);
+	SearchHeadphonesDeviceIdByName(enumerator);
 
 	while (true) {
 		IMMDevice* device = nullptr;
 
 		EnterCriticalSection(&g_criticalSection);
-		result = enumerator->GetDevice(g_foundDeviceId, &device);
+		if (g_foundDeviceId[0u] != L'\0') {
+			result = enumerator->GetDevice(g_foundDeviceId, &device);
+		}
 		LeaveCriticalSection(&g_criticalSection);
 		if (!device) goto waitForDevice;
 
